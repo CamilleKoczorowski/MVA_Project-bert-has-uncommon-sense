@@ -74,7 +74,7 @@ def trial(corpus_slug, embedding_model, metric, override_weights, top_n, query_n
     )
     predict(cfg)
     label_freqs, lemma_freqs = read_stats(cfg)
-    df = pd.read_csv(paths.predictions_tsv_path(cfg), sep="\t", error_bad_lines=False)
+    df = pd.read_csv(paths.predictions_tsv_path(cfg), sep="\t", on_bad_lines='skip')
     lemma_f = get_lemma_f(cfg)
     for min_train_freq, max_train_freq in cfg.train_freq_buckets:
         for min_rarity, max_rarity in cfg.prevalence_buckets:
@@ -308,7 +308,7 @@ def summarize(corpus_slug, embedding_model, metric, override_weights, top_n, que
         bert_layers=[bert_layer],
     )
     label_freqs, lemma_freqs = read_stats(cfg)
-    df = pd.read_csv(paths.predictions_tsv_path(cfg), sep="\t", error_bad_lines=False)
+    df = pd.read_csv(paths.predictions_tsv_path(cfg), sep="\t", on_bad_lines='skip')
     lemma_f = get_lemma_f(cfg)
 
     low_freq, high_freq = (5, 500), (500, 1e9)
@@ -419,7 +419,7 @@ def finetune(transformer_model_name, serialization_path, corpus, num_insts):
         raise Exception(f"Unknown corpus: {corpus}")
 
     model = build_model(vocab, transformer_model_name)
-    model.to("cuda:0")
+    model.to("cpu")
     trainer = build_trainer(model, loader)
     trainer.train()
     transformer_model = model.embedder._token_embedders["tokens"]._matched_embedder.transformer_model

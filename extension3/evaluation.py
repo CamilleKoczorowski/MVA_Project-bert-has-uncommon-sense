@@ -2,36 +2,21 @@
 """
 extension3/evaluation.py — Evaluation pipeline for Extension 3
 ===============================================================
-Re-uses the original paper's similarity ranking evaluation (MAP@50),
-with additional seen/unseen breakdown for generalization analysis.
+Re-uses the original paper's similarity ranking evaluation (MAP@50)
+by calling main.py trial + summarize as subprocesses. This avoids
+the span_embeddings issue since the paper's pipeline correctly handles
+embedding computation with override weights.
 
-Key addition: after contrastive fine-tuning on D_ft (500 instances),
-we evaluate on D_eval = D \ D_ft, splitting queries into:
-  - Q_seen:   queries whose (lemma, sense) appeared in D_ft
-  - Q_unseen: queries whose (lemma, sense) did NOT appear in D_ft
+Additionally computes a seen/unseen breakdown from the predictions TSV.
 """
 
 import os
 import json
-import csv
-from copy import copy
-from collections import defaultdict
+import subprocess
+import sys
+from collections import defaultdict, Counter
 
-import torch
 import pandas as pd
-from tqdm import tqdm
-
-from bssp.common import paths
-from bssp.common.config import Config
-from bssp.common.pickle import pickle_read
-from bssp.common.reading import read_dataset_cached, make_indexer, make_embedder
-from bssp.common.analysis import metrics_at_k, dataset_stats
-from bssp.common.nearest_neighbor_models import (
-    NearestNeighborRetriever,
-    NearestNeighborPredictor,
-    RandomRetriever,
-)
-from bssp.common.util import batch_queries, format_sentence
 
 
 # ---------------------------------------------------------------------------
@@ -49,17 +34,12 @@ def split_train_for_contrastive(
       - D_ft:   instances for contrastive fine-tuning (stratified by sense)
       - D_eval: remaining instances for evaluation database
 
-    Stratified sampling ensures rare senses are represented in D_ft.
-
     Returns:
-        ft_indices: list of int (indices into dataset for fine-tuning)
-        eval_indices: list of int (indices for evaluation database)
-        ft_senses: set of (lemma, sense_label) tuples seen in D_ft
+        ft_indices, eval_indices, ft_senses
     """
     import random
     random.seed(seed)
 
-    from collections import Counter
     sense_freq = Counter()
     lemma_freq = Counter()
     for inst in dataset:
@@ -73,19 +53,16 @@ def split_train_for_contrastive(
         lemma = lemma_from_label_fn(label)
         sense_proportion[label] = count / lemma_freq[lemma]
 
-    # Group indices by sense label
     sense_to_indices = defaultdict(list)
     for i, inst in enumerate(dataset):
         sense_to_indices[inst["label"].label].append(i)
 
-    # Prioritize rare senses in sampling
     rare_senses = {s for s, r in sense_proportion.items() if r < rare_threshold}
     common_senses = set(sense_proportion.keys()) - rare_senses
 
     ft_indices = []
     remaining_budget = num_ft_instances
 
-    # First, sample from rare senses (at least 2 per sense if possible)
     rare_list = sorted(rare_senses)
     random.shuffle(rare_list)
     for sense in rare_list:
@@ -97,7 +74,6 @@ def split_train_for_contrastive(
         ft_indices.extend(sampled)
         remaining_budget -= n_sample
 
-    # Fill remaining budget from common senses
     common_list = sorted(common_senses)
     random.shuffle(common_list)
     for sense in common_list:
@@ -112,7 +88,6 @@ def split_train_for_contrastive(
     ft_set = set(ft_indices)
     eval_indices = [i for i in range(len(dataset)) if i not in ft_set]
 
-    # Record which (lemma, sense) pairs are in D_ft
     ft_senses = set()
     for i in ft_indices:
         label = dataset[i]["label"].label
@@ -127,7 +102,7 @@ def split_train_for_contrastive(
 
 
 # ---------------------------------------------------------------------------
-# Evaluation with seen/unseen breakdown
+# Evaluation using the original paper's pipeline (subprocess)
 # ---------------------------------------------------------------------------
 def evaluate_with_breakdown(
     cfg,
@@ -140,171 +115,131 @@ def evaluate_with_breakdown(
     results_dir,
 ):
     """
-    Run the standard similarity ranking evaluation on D_eval,
-    with additional breakdown into Q_seen and Q_unseen.
-
-    Args:
-        cfg: Config for the model
-        corpus_name: 'clres', 'semcor', etc.
-        train_dataset: full training dataset
-        test_dataset: test/dev dataset (Q)
-        eval_indices: indices of D_eval within train_dataset
-        ft_senses: set of (lemma, sense) seen during fine-tuning
-        lemma_from_label_fn: function to extract lemma from label
-        results_dir: where to save results
-
-    Returns:
-        results: dict with MAP scores per bucket, globally and by seen/unseen
+    Run evaluation using the original paper's main.py trial + summarize,
+    then compute seen/unseen breakdown from the predictions TSV.
     """
-    # Build D_eval subset
-    eval_dataset = [train_dataset[i] for i in eval_indices]
-
-    # Classify queries as seen/unseen
-    q_seen_indices = []
-    q_unseen_indices = []
-    for i, inst in enumerate(test_dataset):
-        label = inst["label"].label
-        lemma = lemma_from_label_fn(label)
-        if (lemma, label) in ft_senses:
-            q_seen_indices.append(i)
-        else:
-            q_unseen_indices.append(i)
-
-    print(f"[eval] Q total: {len(test_dataset)}, Q_seen: {len(q_seen_indices)}, Q_unseen: {len(q_unseen_indices)}")
-
-    # Save the split info
-    split_info = {
-        "num_eval_database": len(eval_dataset),
-        "num_queries_total": len(test_dataset),
-        "num_queries_seen": len(q_seen_indices),
-        "num_queries_unseen": len(q_unseen_indices),
-        "ft_senses": [list(s) for s in ft_senses],
-    }
     os.makedirs(results_dir, exist_ok=True)
+
+    weights_path = cfg.override_weights_path
+    model_name = cfg.embedding_model
+    last_layer = cfg.bert_layers[0] if cfg.bert_layers else 11
+
+    # --- Step 1: Run the paper's trial command ---
+    print("[eval] Running paper's evaluation pipeline with fine-tuned weights...")
+
+    cmd_trial = [
+        sys.executable, "main.py", "trial",
+        "--embedding-model", model_name,
+        "--metric", "cosine",
+        "--query-n", "1",
+        "--bert-layer", str(last_layer),
+        corpus_name,
+    ]
+    if weights_path and os.path.isfile(weights_path):
+        cmd_trial.extend(["--override-weights", weights_path])
+
+    print(f"[eval] Command: {' '.join(cmd_trial)}")
+    result = subprocess.run(cmd_trial, capture_output=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"Trial command failed with return code {result.returncode}")
+
+    # --- Step 2: Run summarize ---
+    cmd_summarize = [
+        sys.executable, "main.py", "summarize",
+        "--embedding-model", model_name,
+        "--metric", "cosine",
+        "--query-n", "1",
+        "--bert-layer", str(last_layer),
+        corpus_name,
+    ]
+    if weights_path and os.path.isfile(weights_path):
+        cmd_summarize.extend(["--override-weights", weights_path])
+
+    print(f"[eval] Command: {' '.join(cmd_summarize)}")
+    result_sum = subprocess.run(cmd_summarize, capture_output=False)
+
+    # --- Step 3: Find and read predictions TSV ---
+    from bssp.common import paths as bssp_paths
+    predictions_path = bssp_paths.predictions_tsv_path(cfg)
+
+    if not os.path.isfile(predictions_path):
+        # Try to find it in cache
+        print(f"[eval] Predictions not at {predictions_path}, searching cache/...")
+        found = False
+        for dirpath, dirnames, filenames in os.walk("cache"):
+            for fn in filenames:
+                if fn.endswith(".tsv") and model_name.replace("-", "") in fn.replace("-", ""):
+                    predictions_path = os.path.join(dirpath, fn)
+                    print(f"[eval] Found: {predictions_path}")
+                    found = True
+                    break
+            if found:
+                break
+
+        if not found:
+            print("[eval] ERROR: could not find predictions TSV")
+            return {"error": "predictions file not found"}
+
+    print(f"[eval] Reading predictions from {predictions_path}")
+    df = pd.read_csv(predictions_path, sep="\t", on_bad_lines="skip")
+
+    # --- Step 4: Compute MAP with seen/unseen split ---
+    seen_mask = []
+    unseen_mask = []
+    for _, row in df.iterrows():
+        label = str(row.get("label", ""))
+        lemma = str(row.get("lemma", ""))
+        if (lemma, label) in ft_senses:
+            seen_mask.append(True)
+            unseen_mask.append(False)
+        else:
+            seen_mask.append(False)
+            unseen_mask.append(True)
+
+    df["is_seen"] = seen_mask
+    df["is_unseen"] = unseen_mask
+
+    n_seen = sum(seen_mask)
+    n_unseen = sum(unseen_mask)
+    print(f"[eval] Q total: {len(df)}, Q_seen: {n_seen}, Q_unseen: {n_unseen}")
+
+    results = {}
+    for subset_name, mask_col in [("global", None), ("seen", "is_seen"), ("unseen", "is_unseen")]:
+        if mask_col is not None:
+            sub_df = df[df[mask_col]].copy()
+        else:
+            sub_df = df.copy()
+
+        if sub_df.empty:
+            results[subset_name] = {"note": f"No {subset_name} queries"}
+            continue
+
+        results[subset_name] = _compute_map_from_predictions(sub_df, cfg.top_n)
+
+    # Save
+    split_info = {
+        "num_queries_total": len(df),
+        "num_queries_seen": n_seen,
+        "num_queries_unseen": n_unseen,
+        "ft_senses_count": len(ft_senses),
+    }
     with open(os.path.join(results_dir, "split_info.json"), "w") as f:
         json.dump(split_info, f, indent=2)
 
-    # Run evaluation on the full Q (standard comparison)
-    # This uses the existing infrastructure from the paper
-    results = {
-        "global": _run_ranking_and_metrics(cfg, eval_dataset, test_dataset, lemma_from_label_fn, corpus_name),
-    }
-
-    # Run on Q_seen only
-    if q_seen_indices:
-        q_seen = [test_dataset[i] for i in q_seen_indices]
-        results["seen"] = _run_ranking_and_metrics(cfg, eval_dataset, q_seen, lemma_from_label_fn, corpus_name)
-
-    # Run on Q_unseen only
-    if q_unseen_indices:
-        q_unseen = [test_dataset[i] for i in q_unseen_indices]
-        results["unseen"] = _run_ranking_and_metrics(cfg, eval_dataset, q_unseen, lemma_from_label_fn, corpus_name)
-
-    # Save results
     with open(os.path.join(results_dir, "map_results.json"), "w") as f:
         json.dump(results, f, indent=2)
 
+    print(f"[eval] Results saved to {results_dir}/map_results.json")
     return results
 
 
-def _run_ranking_and_metrics(cfg, database, queries, lemma_fn, corpus_name):
+def _compute_map_from_predictions(df, top_n=50):
     """
-    Run nearest-neighbor ranking and compute MAP@50 per bucket.
-    Returns dict of {bucket_label: MAP_score}.
+    Compute MAP@50 per bucket from a predictions DataFrame.
+    Columns expected: label, lemma, label_freq_in_train, label_1..label_50.
     """
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    indexer = make_indexer(cfg)
-    vocab, embedder = make_embedder(cfg)
-
-    from allennlp.data import Vocabulary
-    label_vocab = Vocabulary.from_instances(database)
-    label_vocab.extend_from_instances(queries)
-    for ns in ["tokens"]:
-        try:
-            del label_vocab._token_to_index[ns]
-        except KeyError:
-            pass
-        try:
-            del label_vocab._index_to_token[ns]
-        except KeyError:
-            pass
-    vocab.extend_from_vocab(label_vocab)
-
-    model = (
-        NearestNeighborRetriever(
-            vocab=vocab,
-            embedder=embedder,
-            target_dataset=database,
-            distance_metric=cfg.metric,
-            device=device,
-            top_n=cfg.top_n,
-            same_lemma=True,
-        )
-        .eval()
-        .to(device)
-    )
-
-    # Get label frequencies from database
-    from collections import Counter
-    label_freqs = Counter(inst["label"].label for inst in database)
-    lemma_freqs = Counter(lemma_fn(inst["label"].label) for inst in database)
-
-    # Filter queries to those with at least 5 occurrences in database
-    valid_queries = [q for q in queries if label_freqs[q["label"].label] >= 5]
-
-    if not valid_queries:
-        return {"note": "No valid queries (all senses have < 5 instances in D_eval)"}
-
-    # Run predictions
-    from bssp.clres.dataset_reader import ClresConlluReader
-    dummy_reader = ClresConlluReader(split="train", token_indexers={"tokens": indexer})
-    predictor = NearestNeighborPredictor(model=model, dataset_reader=dummy_reader)
-
-    batches = batch_queries(valid_queries, cfg.query_n)
-
-    all_precisions = []  # list of average_precision per query
-
     freq_buckets = [(5, 500), (500, int(1e9))]
     rarity_buckets = [(0.0, 0.25), (0.25, 1.0)]
-    bucket_precisions = {
-        (mf, xf, mr, xr): []
-        for mf, xf in freq_buckets
-        for mr, xr in rarity_buckets
-    }
-
-    with torch.no_grad():
-        for batch in tqdm(batches, desc="Evaluating"):
-            ds = predictor.predict_batch_instance(batch)
-            d = ds[0]
-
-            label = batch[0]["label"].label
-            lemma = lemma_fn(label)
-            label_freq = label_freqs[label]
-            lemma_total = lemma_freqs[lemma]
-            r = label_freq / lemma_total if lemma_total > 0 else 0
-
-            results = d[f"top_{cfg.top_n}"]
-            results += [None for _ in range(cfg.top_n - len(results))]
-
-            # Compute precision at each k
-            hits = 0
-            precisions_at_k = []
-            for k, result in enumerate(results, 1):
-                if result is not None:
-                    idx, dist = result
-                    if database[idx]["label"].label == label:
-                        hits += 1
-                precisions_at_k.append(hits / k)
-
-            avg_precision = sum(precisions_at_k) / len(precisions_at_k) if precisions_at_k else 0
-            all_precisions.append(avg_precision)
-
-            # Assign to bucket
-            for mf, xf in freq_buckets:
-                for mr, xr in rarity_buckets:
-                    if mf <= lemma_total < xf and mr <= r < xr:
-                        bucket_precisions[(mf, xf, mr, xr)].append(avg_precision)
 
     bucket_labels = {
         (5, 500, 0.0, 0.25): "ℓ<500, r<0.25",
@@ -313,10 +248,63 @@ def _run_ranking_and_metrics(cfg, database, queries, lemma_fn, corpus_name):
         (500, int(1e9), 0.25, 1.0): "ℓ≥500, r≥0.25",
     }
 
+    # Load lemma and label frequencies from stats cache
+    lemma_freqs = {}
+    label_freqs = {}
+
+    for stats_dir_name in ["clres_stats", "semcor_stats", "ontonotes_stats"]:
+        lemma_path = f"cache/{stats_dir_name}/train_lemma_freq.tsv"
+        label_path = f"cache/{stats_dir_name}/train_label_freq.tsv"
+        if os.path.isfile(lemma_path):
+            with open(lemma_path) as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) == 2:
+                        lemma_freqs[parts[0]] = int(parts[1])
+            with open(label_path) as f:
+                for line in f:
+                    parts = line.strip().split("\t")
+                    if len(parts) == 2:
+                        label_freqs[parts[0]] = int(parts[1])
+            break
+
+    bucket_precisions = {bkey: [] for bkey in bucket_labels}
+    all_precisions = []
+
+    for _, row in df.iterrows():
+        label = str(row["label"])
+        lemma = str(row["lemma"])
+        freq_label = label_freqs.get(label, int(row.get("label_freq_in_train", 0)))
+        freq_lemma = lemma_freqs.get(lemma, 0)
+
+        if freq_lemma == 0:
+            continue
+
+        r = freq_label / freq_lemma
+
+        # Average precision for this query
+        hits = 0
+        precisions_at_k = []
+        for k in range(1, top_n + 1):
+            col = f"label_{k}"
+            if col in df.columns and pd.notna(row.get(col)):
+                if str(row[col]) == label:
+                    hits += 1
+            precisions_at_k.append(hits / k)
+
+        avg_precision = sum(precisions_at_k) / len(precisions_at_k) if precisions_at_k else 0.0
+        all_precisions.append(avg_precision)
+
+        for bkey in bucket_labels:
+            min_f, max_f, min_r, max_r = bkey
+            if min_f <= freq_lemma < max_f and min_r <= r < max_r:
+                bucket_precisions[bkey].append(avg_precision)
+
     result = {
         "MAP@50_global": round(sum(all_precisions) / max(len(all_precisions), 1) * 100, 2),
         "num_queries": len(all_precisions),
     }
+
     for bkey, blabel in bucket_labels.items():
         precs = bucket_precisions[bkey]
         if precs:
